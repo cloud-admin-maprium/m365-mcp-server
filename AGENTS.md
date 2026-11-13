@@ -5,7 +5,13 @@
 - **stdout is the JSON-RPC channel.** Every log line goes through `tracing` to
   stderr (configured in `src/main.rs::init_logging`). A stray `println!` in the
   server path corrupts the protocol stream. Only `smoke` and `print-tools` may
-  print to stdout, and they never serve.
+  print to stdout, and they never serve. `login` is interactive but writes its
+  prompts to stderr, so stdout stays clean there too.
+- **Auth is delegated and single-user.** `GraphClient::access_token()` only
+  refreshes a token written by `login` (device-code flow). Never reintroduce a
+  `client_credentials` path: an app-only token can read every mailbox in the
+  tenant. `graph_fetch` also rejects any `mailbox` argument that is not
+  `user_email`. Tokens (in `src/token.rs`) are secrets like the client secret.
 - **Tool names, descriptions and response shapes are a compatibility contract.**
   They match `@lnwebworks/outlook-mcp-server` 2.3.1 exactly, because client
   configs and the `daily-briefing` skill reference tool names and read specific

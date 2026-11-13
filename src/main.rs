@@ -8,11 +8,13 @@
 //! stdout is the JSON-RPC channel. All logging goes to stderr — never add a
 //! `println!` outside the `smoke` / `print-tools` subcommands.
 
+mod auth;
 mod config;
 mod graph;
 #[cfg(test)]
 mod http_tests;
 mod out;
+mod token;
 mod tools;
 mod triage;
 
@@ -56,6 +58,8 @@ enum Command {
     },
     /// Print this server's tools/list JSON, resolved through a real MCP client
     PrintTools,
+    /// Sign in once with the device-code flow (delegated, single user)
+    Login,
 }
 
 #[tokio::main]
@@ -67,6 +71,7 @@ async fn main() -> Result<()> {
         Command::Serve => serve(cli.config.as_deref()).await,
         Command::Smoke { mailbox } => smoke(cli.config.as_deref(), mailbox.as_deref()).await,
         Command::PrintTools => print_tools(cli.config.as_deref()).await,
+        Command::Login => login(cli.config.as_deref()).await,
     }
 }
 
@@ -76,6 +81,14 @@ async fn serve(config_path: Option<&std::path::Path>) -> Result<()> {
     if !config.is_configured() {
         tracing::warn!(
             "Graph credentials incomplete — tools will return configuration errors until this is fixed"
+        );
+    }
+    if config.token_path.exists() {
+        tracing::info!("delegated tokens found at {}", config.token_path.display());
+    } else {
+        tracing::warn!(
+            "no delegated tokens at {} — run `m365-mcp-server login`",
+            config.token_path.display()
         );
     }
     if config.source.is_none() {
@@ -134,6 +147,18 @@ async fn print_tools(config_path: Option<&std::path::Path>) -> Result<()> {
     let tools = client.list_all_tools().await.context("tools/list failed")?;
     println!("{}", out::pretty(&serde_json::to_value(&tools)?));
     let _ = client.cancel().await;
+    Ok(())
+}
+
+async fn login(config_path: Option<&std::path::Path>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    if config.tenant_id.is_empty() || config.client_id.is_empty() {
+        anyhow::bail!(
+            "set tenant_id and client_id in the config (or AZURE_TENANT_ID / AZURE_CLIENT_ID) before logging in"
+        );
+    }
+    tracing::info!("{}", config.summary());
+    auth::device_code_login(&config).await?;
     Ok(())
 }
 

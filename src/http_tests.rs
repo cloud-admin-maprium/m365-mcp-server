@@ -11,15 +11,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::config::Config;
 use crate::graph::mail::{DraftRequest, ReplyDraftRequest, ReplyRequest, SendRequest};
 use crate::graph::{GraphClient, GraphError};
+use crate::token::StoredTokens;
 
 fn config() -> Arc<Config> {
     Arc::new(Config {
         tenant_id: "tenant".into(),
         client_id: "client".into(),
-        client_secret: "secret".into(),
+        client_secret: Some("secret".into()),
         user_email: "me@example.com".into(),
+        token_path: std::env::temp_dir()
+            .join(format!("m365-mock-tokens-{}.json", std::process::id())),
         attachment_root: std::env::temp_dir().join("m365-mock-attachments"),
-        calendar_timezone: "W. Australia Standard Time".into(),
+        calendar_timezone: "GMT Standard Time".into(),
         excluded_folder_ids: Default::default(),
         skip_excluded_folders: false,
         signoff_name: "Sam".into(),
@@ -28,19 +31,23 @@ fn config() -> Arc<Config> {
     })
 }
 
-/// Mock the token endpoint on the same server; returns a configured client.
-async fn client_for(server: &MockServer) -> GraphClient {
-    Mock::given(method("POST"))
-        .and(path("/tenant/oauth2/v2.0/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "token-abc",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-        })))
-        .mount(server)
-        .await;
+/// A fresh delegated token with the value the assertions expect.
+fn valid_tokens() -> StoredTokens {
+    StoredTokens {
+        access_token: "token-abc".into(),
+        refresh_token: Some("refresh-abc".into()),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        scope: None,
+        account: Some("me@example.com".into()),
+    }
+}
 
-    GraphClient::with_base_urls(config(), server.uri(), server.uri())
+/// Returns a client with a valid token already cached, so no token request is
+/// needed for the wire assertions.
+async fn client_for(server: &MockServer) -> GraphClient {
+    let client = GraphClient::with_base_urls(config(), server.uri(), server.uri());
+    client.seed_tokens(valid_tokens()).await;
+    client
 }
 
 #[tokio::test]
@@ -184,12 +191,12 @@ async fn graph_errors_surface_the_api_message_and_status() {
 }
 
 #[tokio::test]
-async fn the_access_token_is_cached_across_calls() {
+async fn the_access_token_is_refreshed_once_then_cached() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/tenant/oauth2/v2.0/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "token-abc",
+            "access_token": "refreshed-token",
             "expires_in": 3600,
         })))
         .expect(1)
@@ -197,25 +204,51 @@ async fn the_access_token_is_cached_across_calls() {
         .await;
     Mock::given(method("GET"))
         .and(path("/users/me@example.com/mailFolders"))
+        .and(header("authorization", "Bearer refreshed-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
         .mount(&server)
         .await;
 
     let client = GraphClient::with_base_urls(config(), server.uri(), server.uri());
+    // Seed an expired access token plus a refresh token: the first call must
+    // refresh, the second must reuse the new cached token.
+    client
+        .seed_tokens(StoredTokens {
+            access_token: "stale".into(),
+            refresh_token: Some("refresh-abc".into()),
+            expires_at_ms: 0,
+            scope: None,
+            account: Some("me@example.com".into()),
+        })
+        .await;
+
     client.get_email_folders(None).await.unwrap();
     client.get_email_folders(None).await.unwrap();
-    // `expect(1)` on the token mock is verified on server drop.
+    // `expect(1)` is verified on server drop: exactly one refresh.
 }
 
 #[tokio::test]
 async fn unconfigured_client_fails_before_any_request() {
     let mut raw = (*config()).clone();
-    raw.client_secret = String::new();
+    raw.tenant_id = String::new();
     let client =
         GraphClient::with_base_urls(Arc::new(raw), "http://127.0.0.1:1", "http://127.0.0.1:1");
 
     let err = client.get_email_folders(None).await.unwrap_err();
     assert!(matches!(err, GraphError::NotConfigured));
+}
+
+#[tokio::test]
+async fn a_mailbox_other_than_the_configured_user_is_rejected() {
+    let server = MockServer::start().await;
+    let client = client_for(&server).await;
+
+    let err = client
+        .get_email_folders(Some("someone-else@example.com"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::Message(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -448,6 +481,30 @@ fn server_binary() -> Option<std::path::PathBuf> {
     Some(candidate)
 }
 
+/// Write a fresh delegated token file and return its path.
+fn seed_token_file() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "m365-e2e-tokens-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    crate::token::save(
+        &path,
+        &StoredTokens {
+            access_token: "token-abc".into(),
+            refresh_token: None,
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+            scope: None,
+            account: Some("me@example.com".into()),
+        },
+    )
+    .unwrap();
+    path
+}
+
 /// Spawn the server with credentials pointed at the mock Graph.
 ///
 /// `read_only` is passed as `OUTLOOK_READ_ONLY` only when `Some`; leaving it
@@ -456,13 +513,14 @@ fn server_command(
     exe: &std::path::Path,
     graph_base: &str,
     read_only: Option<&str>,
+    token_path: &std::path::Path,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(exe);
     command
         .env("AZURE_TENANT_ID", "tenant")
         .env("AZURE_CLIENT_ID", "client")
-        .env("AZURE_CLIENT_SECRET", "secret")
         .env("OUTLOOK_USER_EMAIL", "me@example.com")
+        .env("M365_TOKEN_PATH", token_path)
         .env("M365_GRAPH_BASE", graph_base)
         .env("M365_LOGIN_BASE", graph_base)
         .env("M365_CONFIG", "/nonexistent/config.toml")
@@ -482,14 +540,6 @@ async fn end_to_end_read_only_hides_and_rejects_write_tools() {
         return;
     };
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/tenant/oauth2/v2.0/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "token-abc",
-            "expires_in": 3600,
-        })))
-        .mount(&server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/users/me@example.com/mailFolders"))
         .respond_with(ResponseTemplate::new(403).set_body_json(json!({
@@ -498,8 +548,14 @@ async fn end_to_end_read_only_hides_and_rejects_write_tools() {
         .mount(&server)
         .await;
 
-    let transport =
-        rmcp::transport::TokioChildProcess::new(server_command(&exe, &server.uri(), None)).unwrap();
+    let token_path = seed_token_file();
+    let transport = rmcp::transport::TokioChildProcess::new(server_command(
+        &exe,
+        &server.uri(),
+        None,
+        &token_path,
+    ))
+    .unwrap();
     let client = rmcp::ServiceExt::serve((), transport).await.unwrap();
 
     let tools = client.list_all_tools().await.unwrap();
@@ -549,9 +605,14 @@ async fn end_to_end_writable_mode_lists_all_twenty_four_tools() {
     };
     let server = MockServer::start().await;
 
-    let transport =
-        rmcp::transport::TokioChildProcess::new(server_command(&exe, &server.uri(), Some("false")))
-            .unwrap();
+    let token_path = seed_token_file();
+    let transport = rmcp::transport::TokioChildProcess::new(server_command(
+        &exe,
+        &server.uri(),
+        Some("false"),
+        &token_path,
+    ))
+    .unwrap();
     let client = rmcp::ServiceExt::serve((), transport).await.unwrap();
 
     let tools = client.list_all_tools().await.unwrap();

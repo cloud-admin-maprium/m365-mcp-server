@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::token::{self, StoredTokens};
 
 const DEFAULT_GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const DEFAULT_LOGIN_BASE: &str = "https://login.microsoftonline.com";
@@ -52,7 +53,7 @@ pub fn odata_quote(raw: &str) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
     #[error(
-        "Microsoft Graph is not configured — set tenant_id, client_id, client_secret and user_email (config file or AZURE_*/OUTLOOK_USER_EMAIL env vars)"
+        "Microsoft Graph is not configured — set tenant_id and client_id (config file or AZURE_* env vars), then run `m365-mcp-server login`"
     )]
     NotConfigured,
     #[error("Could not obtain an access token: {0}")]
@@ -73,15 +74,10 @@ impl GraphError {
     }
 }
 
-struct CachedToken {
-    value: String,
-    expires_at_ms: i64,
-}
-
 pub struct GraphClient {
     http: reqwest::Client,
     cfg: Arc<Config>,
-    token: Mutex<Option<CachedToken>>,
+    token: Mutex<Option<StoredTokens>>,
     /// Overridable only so tests can point at a mock; set M365_GRAPH_BASE /
     /// M365_LOGIN_BASE to redirect a real run.
     graph_base: String,
@@ -124,30 +120,74 @@ impl GraphClient {
         &self.cfg
     }
 
-    async fn access_token(&self) -> Result<String, GraphError> {
-        {
-            let guard = self.token.lock().await;
-            if let Some(cached) = guard.as_ref()
-                && Utc::now().timestamp_millis() < cached.expires_at_ms - TOKEN_SKEW_MS
-            {
-                return Ok(cached.value.clone());
-            }
-        }
-
+    /// Return a usable delegated access token.
+    ///
+    /// Order: in-memory cache → the token file (`login` wrote it) → a
+    /// refresh-token exchange. There is no client-credentials path: an app-only
+    /// token could read any mailbox in the tenant, which is exactly what this
+    /// server must not be able to do.
+    pub(crate) async fn access_token(&self) -> Result<String, GraphError> {
         if !self.cfg.is_configured() {
             return Err(GraphError::NotConfigured);
         }
 
+        let now = Utc::now().timestamp_millis();
+
+        {
+            let guard = self.token.lock().await;
+            if let Some(cached) = guard.as_ref()
+                && cached.is_fresh(now, TOKEN_SKEW_MS)
+            {
+                return Ok(cached.access_token.clone());
+            }
+        }
+
+        // First request after startup: hydrate from the token file.
+        let stored = {
+            let guard = self.token.lock().await;
+            guard.clone()
+        }
+        .or_else(|| token::load(&self.cfg.token_path));
+
+        let Some(stored) = stored else {
+            return Err(GraphError::Token(
+                "not signed in — run `m365-mcp-server login`".into(),
+            ));
+        };
+
+        if stored.is_fresh(now, TOKEN_SKEW_MS) {
+            *self.token.lock().await = Some(stored.clone());
+            return Ok(stored.access_token);
+        }
+
+        // Keep the expired token in memory so refresh can carry its account
+        // forward, then exchange the refresh token.
+        *self.token.lock().await = Some(stored.clone());
+        let Some(refresh_token) = stored.refresh_token.clone() else {
+            return Err(GraphError::Token(
+                "access token expired and no refresh token — run `m365-mcp-server login`".into(),
+            ));
+        };
+        let refreshed = self.refresh(&refresh_token).await?;
+        Ok(refreshed.access_token)
+    }
+
+    /// Exchange a refresh token for a new access token, persisting the result.
+    async fn refresh(&self, refresh_token: &str) -> Result<StoredTokens, GraphError> {
         let url = format!(
             "{}/{}/oauth2/v2.0/token",
             self.login_base, self.cfg.tenant_id
         );
-        let form = [
+        let scope = crate::auth::scopes(self.cfg.read_only);
+        let mut form: Vec<(&str, &str)> = vec![
             ("client_id", self.cfg.client_id.as_str()),
-            ("client_secret", self.cfg.client_secret.as_str()),
-            ("scope", "https://graph.microsoft.com/.default"),
-            ("grant_type", "client_credentials"),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", scope.as_str()),
         ];
+        if let Some(secret) = self.cfg.client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
 
         let response = self
             .http
@@ -156,7 +196,7 @@ impl GraphClient {
             .send()
             .await
             .map_err(|err| {
-                warn!(error = %err, "token request failed");
+                warn!(error = %err, "token refresh request failed");
                 GraphError::Network(err.to_string())
             })?;
 
@@ -164,18 +204,36 @@ impl GraphClient {
         let body: Value = response.json().await.unwrap_or(Value::Null);
 
         if status.is_success()
-            && let Some(token) = body.get("access_token").and_then(Value::as_str)
+            && let Some(access) = body.get("access_token").and_then(Value::as_str)
         {
             let expires_in = body
                 .get("expires_in")
                 .and_then(Value::as_i64)
                 .unwrap_or(3600);
-            let mut guard = self.token.lock().await;
-            *guard = Some(CachedToken {
-                value: token.to_string(),
+            let account = {
+                let guard = self.token.lock().await;
+                guard.as_ref().and_then(|token| token.account.clone())
+            };
+            let tokens = StoredTokens {
+                access_token: access.to_string(),
+                // Refresh tokens rotate; keep the old one only if none returned.
+                refresh_token: body
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(refresh_token.to_string())),
                 expires_at_ms: Utc::now().timestamp_millis() + expires_in * 1000,
-            });
-            return Ok(token.to_string());
+                scope: body
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                account,
+            };
+            *self.token.lock().await = Some(tokens.clone());
+            if let Err(err) = token::save(&self.cfg.token_path, &tokens) {
+                warn!(error = %err, "could not persist refreshed tokens");
+            }
+            return Ok(tokens);
         }
 
         let detail = body
@@ -185,12 +243,19 @@ impl GraphClient {
             .unwrap_or("no error_description returned");
         warn!(
             status = status.as_u16(),
-            detail, "token endpoint rejected the request"
+            detail, "token endpoint rejected the refresh"
         );
         Err(GraphError::Token(format!(
-            "HTTP {} — {detail}",
+            "HTTP {} — {detail} (run `m365-mcp-server login` if the refresh token expired)",
             status.as_u16()
         )))
+    }
+
+    /// Seed the in-memory token cache. Tests use this to skip the login flow;
+    /// the serve path only ever gets tokens via `login` + `refresh`.
+    #[cfg(test)]
+    pub(crate) async fn seed_tokens(&self, tokens: StoredTokens) {
+        *self.token.lock().await = Some(tokens);
     }
 
     /// The single Graph entry point. `endpoint` is either a path relative to
@@ -216,6 +281,15 @@ impl GraphClient {
 
         if target.is_empty() {
             return Err(GraphError::NotConfigured);
+        }
+
+        // Delegated tokens only reach the signed-in user's mailbox. Reject any
+        // other `mailbox` argument explicitly instead of relying on a Graph 403.
+        let configured = self.cfg.user_email.trim();
+        if !configured.is_empty() && !target.eq_ignore_ascii_case(configured) {
+            return Err(GraphError::Message(format!(
+                "mailbox '{target}' is not the configured user '{configured}' — this server is bound to a single delegated identity"
+            )));
         }
 
         let url = if endpoint.starts_with("http") {

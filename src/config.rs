@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-pub const DEFAULT_TIMEZONE: &str = "W. Australia Standard Time";
+pub const DEFAULT_TIMEZONE: &str = "GMT Standard Time";
 pub const DEFAULT_SIGNOFF: &str = "The Team";
 
 /// Flat on-disk shape. Every field is optional so a partial config file still loads.
@@ -19,6 +19,7 @@ struct FileConfig {
     client_id: Option<String>,
     client_secret: Option<String>,
     user_email: Option<String>,
+    token_path: Option<String>,
     attachment_root: Option<String>,
     calendar_timezone: Option<String>,
     excluded_folder_ids: Option<Vec<String>>,
@@ -31,8 +32,12 @@ struct FileConfig {
 pub struct Config {
     pub tenant_id: String,
     pub client_id: String,
-    pub client_secret: String,
+    /// Optional: delegated device-code flow works as a public client (no secret).
+    /// Set it only if the app registration is a confidential client.
+    pub client_secret: Option<String>,
     pub user_email: String,
+    /// Where delegated access/refresh tokens are cached (`0600`).
+    pub token_path: PathBuf,
     pub attachment_root: PathBuf,
     pub calendar_timezone: String,
     pub excluded_folder_ids: HashSet<String>,
@@ -75,6 +80,12 @@ impl Config {
             .map(|s| expand_tilde(&s))
             .unwrap_or_else(default_attachment_root);
 
+        let token_path = env_str("M365_TOKEN_PATH")
+            .or(file.token_path)
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| expand_tilde(&s))
+            .unwrap_or_else(default_token_path);
+
         let excluded = env_str("OUTLOOK_EXCLUDED_FOLDER_IDS")
             .or_else(|| file.excluded_folder_ids.map(|v| v.join(",")))
             .unwrap_or_default()
@@ -98,10 +109,11 @@ impl Config {
                 .unwrap_or_default(),
             client_secret: env_str("AZURE_CLIENT_SECRET")
                 .or(file.client_secret)
-                .unwrap_or_default(),
+                .filter(|s| !s.trim().is_empty()),
             user_email: env_str("OUTLOOK_USER_EMAIL")
                 .or(file.user_email)
                 .unwrap_or_default(),
+            token_path,
             attachment_root,
             calendar_timezone: tz,
             excluded_folder_ids: excluded,
@@ -118,19 +130,19 @@ impl Config {
         })
     }
 
-    /// Mirrors `GraphClient.isConfigured` in the JS original, including the
-    /// "your_" placeholder guard.
+    /// Delegated mode needs a tenant, client id and the target user; the client
+    /// secret is optional (public client) and `login` supplies the tokens at
+    /// runtime.
     pub fn is_configured(&self) -> bool {
         !self.tenant_id.is_empty()
             && !self.client_id.is_empty()
-            && !self.client_secret.is_empty()
             && !self.user_email.is_empty()
             && !self.tenant_id.contains("your_")
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "configured={} read_only={} mailbox={} tz={} attachment_root={} config={}",
+            "configured={} read_only={} auth=delegated mailbox={} tz={} attachment_root={} tokens={} config={}",
             self.is_configured(),
             self.read_only,
             if self.user_email.is_empty() {
@@ -140,6 +152,7 @@ impl Config {
             },
             self.calendar_timezone,
             self.attachment_root.display(),
+            self.token_path.display(),
             self.source
                 .as_ref()
                 .map_or("<defaults>".to_string(), |p| p.display().to_string()),
@@ -157,6 +170,10 @@ fn default_config_path() -> PathBuf {
 
 fn default_attachment_root() -> PathBuf {
     home().join("Downloads")
+}
+
+fn default_token_path() -> PathBuf {
+    home().join(".config").join("m365-mcp").join("tokens.json")
 }
 
 fn home() -> PathBuf {
@@ -207,8 +224,9 @@ mod tests {
         let cfg = Config {
             tenant_id: "your_tenant_id".into(),
             client_id: "c".into(),
-            client_secret: "s".into(),
+            client_secret: Some("s".into()),
             user_email: "u@example.com".into(),
+            token_path: PathBuf::from("/tmp/tokens.json"),
             attachment_root: PathBuf::from("/tmp"),
             calendar_timezone: DEFAULT_TIMEZONE.into(),
             excluded_folder_ids: HashSet::new(),

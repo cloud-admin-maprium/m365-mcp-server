@@ -1,19 +1,31 @@
-# Azure AD app registration (client-credentials flow)
+# Azure AD app registration — delegated (single-user) auth
+#
+# This server signs in as ONE user via the device-code flow and can only ever
+# reach that user's mailbox. Register the app with *delegated* Graph permissions
+# (not application permissions), then run `m365-mcp-server login` once.
 tenant_id = ""
 client_id = ""
-client_secret = ""
 
-# Mailbox this server acts on by default (any tool can override it per call with
-# the optional `mailbox` argument)
+# Optional. Only set it if the registration is a confidential client; the
+# device-code flow works as a public client without a secret.
+# client_secret = ""
+
+# The single account this server is bound to. Any `mailbox` argument that does
+# not match this address is rejected, and delegated tokens cannot reach another
+# user's mailbox anyway.
 user_email = ""
+
+# Where delegated access/refresh tokens are cached (mode 0600). Default:
+# ~/.config/m365-mcp/tokens.json
+# token_path = "~/.config/m365-mcp/tokens.json"
 
 # Where local attachments may be read from. Anything outside this directory is
 # refused, symlinks are resolved before the check. Default: ~/Downloads
 # attachment_root = "~/Downloads"
 
 # Windows timezone name sent with calendar writes (Graph's dateTimeTimeZone
-# format, not IANA). Default: W. Australia Standard Time
-# calendar_timezone = "W. Australia Standard Time"
+# format, not IANA). Default: GMT Standard Time (Ireland/UK)
+# calendar_timezone = "GMT Standard Time"
 
 # Optional: Graph folder IDs excluded from get_recent_emails_all_folders.
 # excluded_folder_ids = []
@@ -23,3 +35,7 @@ user_email = ""
 
 # Sign-off name used in triage_email's suggested replies. Default: The Team
 # signoff_name = ""
+
+# Read-only by default: 12 read tools, write tools hidden. Set false (and grant
+# the *Write delegated scopes*) to enable writes.
+# read_only = true

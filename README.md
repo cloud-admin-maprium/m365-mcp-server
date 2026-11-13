@@ -4,10 +4,11 @@ Outlook / Microsoft 365 MCP server over Microsoft Graph — a Rust port of
 [`@lnwebworks/outlook-mcp-server`](https://github.com/access-ctrl/outlook-mcp-server)
 (MIT), built as a single local binary.
 
-App-only authentication (client credentials), stdio transport. **Read-only by
-default**: 12 read tools, with the 12 write tools hidden from `tools/list` and
-rejected by `tools/call`. No OAuth consent flow, no sessions, no resources — one
-binary, one config file.
+Delegated, single-user authentication (device-code flow), stdio transport.
+**Read-only by default**: 12 read tools, with the 12 write tools hidden from
+`tools/list` and rejected by `tools/call`. The server is bound to one signed-in
+account and cannot read any other mailbox in the tenant. One binary, one config
+file, one token file.
 
 ## Build and install
 
@@ -29,21 +30,41 @@ chmod 600 ~/.config/m365-mcp/config.toml
 $EDITOR ~/.config/m365-mcp/config.toml
 ```
 
-`tenant_id`, `client_id`, `client_secret`, `user_email` are required; everything
-else has a default. The file must be readable only by you — the server warns at
-startup if it is not. A config path can also be passed with `--config` or
-`M365_CONFIG`.
+`tenant_id` and `client_id` are required; `client_secret` is optional (the
+device-code flow works as a public client). Everything else has a default. The
+file must be readable only by you — the server warns at startup if it is not. A
+config path can also be passed with `--config` or `M365_CONFIG`.
+
+Then sign in once. This runs the device-code flow, prints a URL and code, and
+writes delegated tokens to `~/.config/m365-mcp/tokens.json` (mode `0600`):
+
+```bash
+m365-mcp-server login
+```
+
+`user_email` must be the account you sign in as: the server is bound to that one
+identity, and any `mailbox` argument pointing elsewhere is rejected.
+
+`calendar_timezone` defaults to `GMT Standard Time` (Ireland/UK, which Graph
+maps from `Europe/Dublin`); an explicit value in the config file or
+`OUTLOOK_CALENDAR_TIMEZONE` keeps taking precedence, so existing setups are
+unaffected.
 
 Every value can be overridden by environment variables, which is handy for a
 one-off run: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
-`OUTLOOK_USER_EMAIL`, `OUTLOOK_ATTACHMENT_ROOT`, `OUTLOOK_CALENDAR_TIMEZONE`,
-`OUTLOOK_EXCLUDED_FOLDER_IDS`, `OUTLOOK_SKIP_EXCLUDED_FOLDERS`,
-`OUTLOOK_SIGNOFF_NAME`, `OUTLOOK_READ_ONLY`.
+`OUTLOOK_USER_EMAIL`, `M365_TOKEN_PATH`, `OUTLOOK_ATTACHMENT_ROOT`,
+`OUTLOOK_CALENDAR_TIMEZONE`, `OUTLOOK_EXCLUDED_FOLDER_IDS`,
+`OUTLOOK_SKIP_EXCLUDED_FOLDERS`, `OUTLOOK_SIGNOFF_NAME`, `OUTLOOK_READ_ONLY`.
 
-The Azure app registration needs the **application** permissions `Mail.Read` and
-`Calendars.Read` (admin-consented) for read-only operation. Add
-`Mail.ReadWrite` / `Calendars.ReadWrite` only if you turn writes back on. In
-either case the app needs access to the target mailbox.
+The Azure app registration needs the **delegated** Graph permissions `Mail.Read`
+and `Calendars.Read` for read-only operation (add `Mail.ReadWrite` /
+`Calendars.ReadWrite` only if you turn writes back on), plus `offline_access`,
+`openid` and `profile`. Enable **"Allow public client flows"** so the device-code
+flow works, then `m365-mcp-server login` performs the one-time consent.
+
+Because the token is delegated, the app can only reach the signed-in user's
+mailbox — this is the boundary that an application permission like `Mail.Read.All`
+does not have.
 
 ## Read-only mode
 
@@ -111,8 +132,9 @@ token fetch plus two Graph round-trips can exceed.
 ## Verify without a client
 
 ```bash
-m365-mcp-server print-tools   # tools/list JSON, resolved through a real MCP client
-m365-mcp-server smoke         # live get_todays_briefing, exit 1 on Graph errors
+m365-mcp-server login        # one-time device-code sign-in, writes tokens
+m365-mcp-server print-tools  # tools/list JSON, resolved through a real MCP client
+m365-mcp-server smoke        # live get_todays_briefing, exit 1 on Graph errors
 ```
 
 `print-tools` spawns this binary as a child and performs the real MCP handshake,
@@ -145,7 +167,7 @@ Response shapes, key order, tool names and descriptions are otherwise
 byte-identical.
 
 1. **Failures are flagged.** Upstream returns `{"error": "..."}` with `isError`
-   unset, so an expired secret looks like a successful tool call. Here the
+   unset, so an expired token looks like a successful tool call. Here the
    payload is unchanged but the result is marked `isError`, and a `WARN` goes to
    stderr with the Graph status and message.
 2. **Attachments are inline-only, up to 3MB combined.** The upstream
@@ -155,7 +177,9 @@ byte-identical.
    `~/Downloads`. Paths are canonicalised, then checked component-wise against
    the root — stricter than upstream's string-prefix test.
 4. **`calendar_timezone` replaces the hardcoded `W. Australia Standard Time`**
-   (still the default). Graph wants Windows timezone names here, not IANA.
+   and defaults to `GMT Standard Time` (Ireland/UK, `Europe/Dublin`). Graph wants
+   Windows timezone names here, not IANA, so set e.g. `Pacific Standard Time`
+   for a mailbox elsewhere.
 5. **OData literals are escaped.** `conversationId` goes into a `$filter` with
    `'` doubled; upstream interpolates it raw.
 6. **`bodyPreview` truncation counts characters**, not UTF-16 code units, so it
@@ -164,17 +188,23 @@ byte-identical.
 8. **Read-only by default.** Upstream exposes all 24 tools unconditionally; here
    the 12 write tools are disabled at the router unless `read_only = false`. The
    names, schemas and responses of the remaining 12 are unchanged.
+9. **Delegated, single-user auth instead of app-only.** Upstream uses client
+   credentials (`Mail.Read.All` application permission), which can read every
+   mailbox in the tenant. Here the server signs in as one user via the
+   device-code flow and is bound to that identity: the `mailbox` argument cannot
+   point at anyone else.
 
 ## Testing
 
 ```bash
-make test         # builds the bin first, then 45 tests
+make test         # builds the bin first, then 51 tests
 ```
 
 - `src/http_tests.rs` runs the client against a mock Graph server and asserts the
   exact endpoint strings, query encoding (`$search="..."`, `%20` not `+`),
   `Content-Type`/`Authorization`/`ConsistencyLevel` headers, JSON request bodies,
-  token caching (one token request for two calls), and 202/204 handling.
+  a single refresh-token exchange reused across calls, and 202/204 handling.
+  Tokens are seeded in memory, so no Azure credentials are needed.
 - Output-shape tests pin the `undefined`-omitted vs `null`-emitted distinction,
   which is the easiest thing to break when refactoring.
 - Two end-to-end tests spawn the real binary and speak MCP over stdio: one
@@ -195,9 +225,11 @@ latter). All logs go to stderr; stdout is the JSON-RPC channel.
 ## Layout
 
 ```
-src/main.rs            CLI: serve (default) | smoke | print-tools
+src/main.rs            CLI: serve (default) | smoke | print-tools | login
 src/config.rs          TOML + env override, permission check, path expansion
-src/graph/mod.rs       token cache, graph_fetch, query encoding, shared types
+src/auth.rs            delegated device-code flow, scope set
+src/token.rs           on-disk access/refresh token cache (0600)
+src/graph/mod.rs       delegated token cache + refresh, graph_fetch, query encoding
 src/graph/mail.rs      mail ops + response mappers
 src/graph/calendar.rs  calendar ops + daily briefing
 src/graph/attach.rs    attachment resolution, limits, inline base64
