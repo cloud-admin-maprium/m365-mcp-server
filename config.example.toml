@@ -1,0 +1,25 @@
+# Azure AD app registration (client-credentials flow)
+tenant_id = ""
+client_id = ""
+client_secret = ""
+
+# Mailbox this server acts on by default (any tool can override it per call with
+# the optional `mailbox` argument)
+user_email = ""
+
+# Where local attachments may be read from. Anything outside this directory is
+# refused, symlinks are resolved before the check. Default: ~/Downloads
+# attachment_root = "~/Downloads"
+
+# Windows timezone name sent with calendar writes (Graph's dateTimeTimeZone
+# format, not IANA). Default: W. Australia Standard Time
+# calendar_timezone = "W. Australia Standard Time"
+
+# Optional: Graph folder IDs excluded from get_recent_emails_all_folders.
+# excluded_folder_ids = []
+
+# Master on/off switch for the exclusion list above. Default: false
+# skip_excluded_folders = false
+
+# Sign-off name used in triage_email's suggested replies. Default: The Team
+# signoff_name = ""

@@ -1,0 +1,50 @@
+[package]
+name = "m365-mcp-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Outlook / Microsoft 365 MCP server over Microsoft Graph — Rust port of @lnwebworks/outlook-mcp-server"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+percent-encoding = "2.3"
+regex = "1.11"
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "json",
+    "form",
+    "native-tls",
+] }
+rmcp = { version = "3.10", features = [
+    "client",
+    "transport-child-process",
+    "transport-io",
+] }
+schemars = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+tokio = { version = "1.40", features = [
+    "fs",
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
