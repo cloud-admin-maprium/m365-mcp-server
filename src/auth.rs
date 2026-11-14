@@ -24,8 +24,10 @@ const DEFAULT_LOGIN_BASE: &str = "https://login.microsoftonline.com";
 
 /// Scopes requested for delegated access. Write scopes are omitted when the
 /// server runs read-only, so the consent prompt matches what the tools can do.
+/// The `.Shared` scopes are only added when shared mailboxes are configured:
+/// they are what lets `/users/{other-mailbox}` resolve for the signed-in user.
 /// `offline_access` is what yields a refresh token.
-pub fn scopes(read_only: bool) -> String {
+pub fn scopes(read_only: bool, shared: bool) -> String {
     let mut parts = vec![
         "offline_access",
         "openid",
@@ -33,9 +35,18 @@ pub fn scopes(read_only: bool) -> String {
         "https://graph.microsoft.com/Mail.Read",
         "https://graph.microsoft.com/Calendars.Read",
     ];
+    if shared {
+        parts.push("https://graph.microsoft.com/Mail.Read.Shared");
+        parts.push("https://graph.microsoft.com/Calendars.Read.Shared");
+    }
     if !read_only {
         parts.push("https://graph.microsoft.com/Mail.ReadWrite");
+        parts.push("https://graph.microsoft.com/Mail.Send");
         parts.push("https://graph.microsoft.com/Calendars.ReadWrite");
+        if shared {
+            parts.push("https://graph.microsoft.com/Mail.ReadWrite.Shared");
+            parts.push("https://graph.microsoft.com/Calendars.ReadWrite.Shared");
+        }
     }
     parts.join(" ")
 }
@@ -44,7 +55,7 @@ pub fn scopes(read_only: bool) -> String {
 pub async fn device_code_login(cfg: &Config) -> Result<StoredTokens> {
     let login = std::env::var("M365_LOGIN_BASE").unwrap_or_else(|_| DEFAULT_LOGIN_BASE.to_string());
     let http = reqwest::Client::new();
-    let scope = scopes(cfg.read_only);
+    let scope = scopes(cfg.read_only, !cfg.shared_mailboxes.is_empty());
 
     let start: Value = {
         let mut form: Vec<(&str, &str)> = vec![
@@ -106,8 +117,7 @@ pub async fn device_code_login(cfg: &Config) -> Result<StoredTokens> {
         if let Some(secret) = cfg.client_secret.as_deref() {
             form.push(("client_secret", secret));
         }
-        let encoded: String = serde_urlencoded::to_string(&form)
-            .unwrap_or_default();
+        let encoded: String = serde_urlencoded::to_string(&form).unwrap_or_default();
         tracing::debug!(body = encoded, "token poll encoded body");
 
         let response = http
@@ -206,17 +216,34 @@ mod tests {
 
     #[test]
     fn read_only_scopes_have_no_write_permissions() {
-        let read = scopes(true);
+        let read = scopes(true, false);
         assert!(read.contains("Mail.Read"));
         assert!(!read.contains("Mail.ReadWrite"));
+        assert!(!read.contains("Mail.Send"));
         assert!(read.contains("offline_access"));
     }
 
     #[test]
-    fn writable_scopes_add_write_permissions() {
-        let write = scopes(false);
+    fn writable_scopes_add_write_and_send_permissions() {
+        let write = scopes(false, false);
         assert!(write.contains("Mail.ReadWrite"));
+        assert!(write.contains("Mail.Send"));
         assert!(write.contains("Calendars.ReadWrite"));
+    }
+
+    #[test]
+    fn shared_scopes_are_only_requested_when_configured() {
+        let own = scopes(true, false);
+        assert!(!own.contains(".Shared"));
+
+        let shared_read = scopes(true, true);
+        assert!(shared_read.contains("Mail.Read.Shared"));
+        assert!(shared_read.contains("Calendars.Read.Shared"));
+        assert!(!shared_read.contains("Mail.ReadWrite.Shared"));
+
+        let shared_write = scopes(false, true);
+        assert!(shared_write.contains("Mail.ReadWrite.Shared"));
+        assert!(shared_write.contains("Calendars.ReadWrite.Shared"));
     }
 
     #[test]

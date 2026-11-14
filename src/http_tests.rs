@@ -19,6 +19,7 @@ fn config() -> Arc<Config> {
         client_id: "client".into(),
         client_secret: Some("secret".into()),
         user_email: "me@example.com".into(),
+        shared_mailboxes: Vec::new(),
         token_path: std::env::temp_dir()
             .join(format!("m365-mock-tokens-{}.json", std::process::id())),
         attachment_root: std::env::temp_dir().join("m365-mock-attachments"),
@@ -248,6 +249,64 @@ async fn a_mailbox_other_than_the_configured_user_is_rejected() {
         .await
         .unwrap_err();
     assert!(matches!(err, GraphError::Message(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_configured_shared_mailbox_is_routed_to_that_mailbox() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/devops@example.com/mailFolders"))
+        .and(header("authorization", "Bearer token-abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+
+    let mut raw = (*config()).clone();
+    raw.shared_mailboxes = vec!["devops@example.com".into()];
+    let client = GraphClient::with_base_urls(Arc::new(raw), server.uri(), server.uri());
+    client.seed_tokens(valid_tokens()).await;
+
+    let value = client
+        .get_email_folders(Some("devops@example.com"))
+        .await
+        .unwrap();
+    assert_eq!(value, json!([]));
+}
+
+#[tokio::test]
+async fn a_mailbox_outside_the_shared_allowlist_is_still_rejected() {
+    let server = MockServer::start().await;
+    let mut raw = (*config()).clone();
+    raw.shared_mailboxes = vec!["devops@example.com".into()];
+    let client = GraphClient::with_base_urls(Arc::new(raw), server.uri(), server.uri());
+    client.seed_tokens(valid_tokens()).await;
+
+    let err = client
+        .get_email_folders(Some("support@example.com"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::Message(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_on_a_shared_mailbox_fails_before_any_request() {
+    let server = MockServer::start().await;
+    let mut raw = (*config()).clone();
+    raw.shared_mailboxes = vec!["devops@example.com".into()];
+    let client = GraphClient::with_base_urls(Arc::new(raw), server.uri(), server.uri());
+    client.seed_tokens(valid_tokens()).await;
+
+    let err = client
+        .search_emails("invoice", 10, Some("devops@example.com"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::Message(_)));
+    assert!(
+        err.to_string()
+            .contains("not supported on shared mailboxes")
+    );
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 

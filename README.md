@@ -7,8 +7,9 @@ Outlook / Microsoft 365 MCP server over Microsoft Graph — a Rust port of
 Delegated, single-user authentication (device-code flow), stdio transport.
 **Read-only by default**: 12 read tools, with the 12 write tools hidden from
 `tools/list` and rejected by `tools/call`. The server is bound to one signed-in
-account and cannot read any other mailbox in the tenant. One binary, one config
-file, one token file.
+account: it reaches that user's own mailbox plus any shared mailbox the user has
+been delegated in Exchange and that is listed in `shared_mailboxes`. One binary,
+one config file, one token file.
 
 ## Build and install
 
@@ -42,8 +43,9 @@ writes delegated tokens to `~/.config/m365-mcp/tokens.json` (mode `0600`):
 m365-mcp-server login
 ```
 
-`user_email` must be the account you sign in as: the server is bound to that one
-identity, and any `mailbox` argument pointing elsewhere is rejected.
+`user_email` must be the account you sign in as. Any `mailbox` argument must
+match that address or an entry in `shared_mailboxes`; everything else is
+rejected before a request is made.
 
 `calendar_timezone` defaults to `GMT Standard Time` (Ireland/UK, which Graph
 maps from `Europe/Dublin`); an explicit value in the config file or
@@ -52,19 +54,56 @@ unaffected.
 
 Every value can be overridden by environment variables, which is handy for a
 one-off run: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
-`OUTLOOK_USER_EMAIL`, `M365_TOKEN_PATH`, `OUTLOOK_ATTACHMENT_ROOT`,
-`OUTLOOK_CALENDAR_TIMEZONE`, `OUTLOOK_EXCLUDED_FOLDER_IDS`,
-`OUTLOOK_SKIP_EXCLUDED_FOLDERS`, `OUTLOOK_SIGNOFF_NAME`, `OUTLOOK_READ_ONLY`.
+`OUTLOOK_USER_EMAIL`, `OUTLOOK_SHARED_MAILBOXES`, `M365_TOKEN_PATH`,
+`OUTLOOK_ATTACHMENT_ROOT`, `OUTLOOK_CALENDAR_TIMEZONE`,
+`OUTLOOK_EXCLUDED_FOLDER_IDS`, `OUTLOOK_SKIP_EXCLUDED_FOLDERS`,
+`OUTLOOK_SIGNOFF_NAME`, `OUTLOOK_READ_ONLY`.
 
 The Azure app registration needs the **delegated** Graph permissions `Mail.Read`
-and `Calendars.Read` for read-only operation (add `Mail.ReadWrite` /
-`Calendars.ReadWrite` only if you turn writes back on), plus `offline_access`,
+and `Calendars.Read` for read-only operation (add `Mail.ReadWrite`, `Mail.Send`
+and `Calendars.ReadWrite` only if you turn writes back on), plus `offline_access`,
 `openid` and `profile`. Enable **"Allow public client flows"** so the device-code
 flow works, then `m365-mcp-server login` performs the one-time consent.
 
-Because the token is delegated, the app can only reach the signed-in user's
-mailbox — this is the boundary that an application permission like `Mail.Read.All`
-does not have.
+Because the token is delegated, the app can only reach mailboxes the signed-in
+user already has Exchange access to — this is the boundary that an application
+permission like `Mail.Read.All` does not have.
+
+### Shared mailboxes
+
+Delegated access covers shared mailboxes without a second sign-in: you keep
+using `cloud.admin@maprium.com`, and pass `mailbox: "devops@maprium.com"` to any
+tool. Three things have to line up.
+
+1. **Exchange**: the signed-in user needs **Full Access** on the shared mailbox
+   (Exchange admin center → Recipients → Mailboxes → Delegation). Sending *from*
+   it additionally needs **Send As** or **Send on Behalf**. Permission changes
+   can take up to an hour to replicate.
+2. **Config**: name the mailbox explicitly — Graph has no endpoint that lists the
+   mailboxes a delegated user can reach:
+
+   ```toml
+   user_email = "cloud.admin@maprium.com"
+   shared_mailboxes = ["devops@maprium.com"]
+   ```
+
+   or `OUTLOOK_SHARED_MAILBOXES=devops@maprium.com,support@maprium.com`.
+3. **App registration + consent**: add `Mail.Read.Shared` and
+   `Calendars.Read.Shared` to the app's delegated API permissions (plus the
+   `ReadWrite` / `Send` variants when `read_only = false`), then run
+   `m365-mcp-server login` again — a token refresh does not widen an existing
+   token. The server warns at startup when the saved token predates this.
+
+A request for a mailbox outside the allowlist fails locally with a clear message;
+an Exchange permission problem surfaces as Graph `403` (`ErrorAccessDenied`, or
+`ErrorSendAsDenied` when sending). A `404` usually means the SMTP address did not
+resolve — use the mailbox's user principal name or object id.
+
+Known limitation: Graph rejects `$search` on shared and delegated mailboxes, so
+`search_emails` returns an explicit error for them. Use `get_recent_emails`,
+`get_unread_emails` or `get_email_folders` with the shared `mailbox` instead.
+`excluded_folder_ids` is also per-mailbox — folder ids configured for your own
+mailbox do not match the shared mailbox's folders.
 
 ## Read-only mode
 
@@ -191,13 +230,14 @@ byte-identical.
 9. **Delegated, single-user auth instead of app-only.** Upstream uses client
    credentials (`Mail.Read.All` application permission), which can read every
    mailbox in the tenant. Here the server signs in as one user via the
-   device-code flow and is bound to that identity: the `mailbox` argument cannot
-   point at anyone else.
+   device-code flow: the `mailbox` argument is limited to that identity plus an
+   explicit `shared_mailboxes` allowlist, and Graph still enforces the Exchange
+   permissions behind it.
 
 ## Testing
 
 ```bash
-make test         # builds the bin first, then 51 tests
+make test         # builds the bin first, then 59 tests
 ```
 
 - `src/http_tests.rs` runs the client against a mock Graph server and asserts the

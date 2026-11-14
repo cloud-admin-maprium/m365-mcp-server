@@ -377,6 +377,18 @@ impl GraphClient {
         limit: u32,
         mailbox: Option<&str>,
     ) -> Result<Value, GraphError> {
+        // KQL `$search` only works against the signed-in user's own mailbox;
+        // Graph rejects it on shared/delegated mailboxes. Fail with something
+        // actionable instead of surfacing `ErrorInvalidRequest`.
+        let primary = self.config().user_email.trim();
+        if let Some(target) = mailbox.map(str::trim).filter(|value| !value.is_empty())
+            && !target.eq_ignore_ascii_case(primary)
+            && self.config().allows_mailbox(target)
+        {
+            return Err(GraphError::message(
+                "$search is not supported on shared mailboxes — use get_recent_emails or get_unread_emails for that mailbox, or search your own mailbox",
+            ));
+        }
         let endpoint = format!(
             "/messages?$search=\"{}\"&$top={limit}&$select={SEARCH_SELECT}",
             enc(query)

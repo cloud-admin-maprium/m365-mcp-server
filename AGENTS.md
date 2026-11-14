@@ -10,8 +10,9 @@
 - **Auth is delegated and single-user.** `GraphClient::access_token()` only
   refreshes a token written by `login` (device-code flow). Never reintroduce a
   `client_credentials` path: an app-only token can read every mailbox in the
-  tenant. `graph_fetch` also rejects any `mailbox` argument that is not
-  `user_email`. Tokens (in `src/token.rs`) are secrets like the client secret.
+  tenant. `graph_fetch` also rejects any `mailbox` argument that is neither
+  `user_email` nor an entry in `shared_mailboxes` (`Config::allows_mailbox`).
+  Tokens (in `src/token.rs`) are secrets like the client secret.
 - **Tool names, descriptions and response shapes are a compatibility contract.**
   They match `@lnwebworks/outlook-mcp-server` 2.3.1 exactly, because client
   configs and the `daily-briefing` skill reference tool names and read specific
