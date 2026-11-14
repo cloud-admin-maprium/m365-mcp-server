@@ -1,8 +1,9 @@
 # Azure AD app registration — delegated (single-user) auth
 #
-# This server signs in as ONE user via the device-code flow and can only ever
-# reach that user's mailbox. Register the app with *delegated* Graph permissions
-# (not application permissions), then run `m365-mcp-server login` once.
+# This server signs in as ONE user via the device-code flow and can reach that
+# user's mailbox plus any shared mailbox listed in `shared_mailboxes` below
+# (subject to Exchange permissions). Register the app with *delegated* Graph
+# permissions (not application permissions), then run `m365-mcp-server login`.
 tenant_id = ""
 client_id = ""
 
@@ -10,10 +11,16 @@ client_id = ""
 # device-code flow works as a public client without a secret.
 # client_secret = ""
 
-# The single account this server is bound to. Any `mailbox` argument that does
-# not match this address is rejected, and delegated tokens cannot reach another
-# user's mailbox anyway.
+# The account this server signs in as. Any `mailbox` argument that does not
+# match this address or an entry in `shared_mailboxes` is rejected.
 user_email = ""
+
+# Shared mailboxes the signed-in user has been delegated in Exchange. Graph has
+# no endpoint that lists these, so they must be named here. Configuring at least
+# one adds the `Mail.*.Shared` / `Calendars.*.Shared` delegated scopes, which
+# requires re-running `m365-mcp-server login`. Exchange must grant the user Full
+# Access (and Send As for sending) before requests succeed.
+# shared_mailboxes = ["devops@example.com"]
 
 # Where delegated access/refresh tokens are cached (mode 0600). Default:
 # ~/.config/m365-mcp/tokens.json

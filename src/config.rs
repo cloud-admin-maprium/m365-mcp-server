@@ -19,6 +19,7 @@ struct FileConfig {
     client_id: Option<String>,
     client_secret: Option<String>,
     user_email: Option<String>,
+    shared_mailboxes: Option<Vec<String>>,
     token_path: Option<String>,
     attachment_root: Option<String>,
     calendar_timezone: Option<String>,
@@ -36,6 +37,11 @@ pub struct Config {
     /// Set it only if the app registration is a confidential client.
     pub client_secret: Option<String>,
     pub user_email: String,
+    /// Mailboxes the signed-in user has been delegated access to (shared
+    /// mailboxes). Graph cannot enumerate these, so they are configured
+    /// explicitly. Works only when the tenant granted the `Mail.*.Shared`
+    /// delegated scopes and Exchange granted Full Access.
+    pub shared_mailboxes: Vec<String>,
     /// Where delegated access/refresh tokens are cached (`0600`).
     pub token_path: PathBuf,
     pub attachment_root: PathBuf,
@@ -100,6 +106,29 @@ impl Config {
             .or(file.skip_excluded_folders)
             .unwrap_or(false);
 
+        let user_email = env_str("OUTLOOK_USER_EMAIL")
+            .or(file.user_email)
+            .unwrap_or_default();
+
+        // Graph has no endpoint that lists the mailboxes a delegated user can
+        // reach, so shared mailboxes are named explicitly. Dedupe
+        // case-insensitively while preserving the configured order.
+        let shared_mailboxes = env_str("OUTLOOK_SHARED_MAILBOXES")
+            .or_else(|| file.shared_mailboxes.map(|v| v.join(",")))
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .fold(Vec::new(), |mut acc, address| {
+                if !acc
+                    .iter()
+                    .any(|seen: &String| seen.eq_ignore_ascii_case(address))
+                {
+                    acc.push(address.to_string());
+                }
+                acc
+            });
+
         Ok(Self {
             tenant_id: env_str("AZURE_TENANT_ID")
                 .or(file.tenant_id)
@@ -110,9 +139,8 @@ impl Config {
             client_secret: env_str("AZURE_CLIENT_SECRET")
                 .or(file.client_secret)
                 .filter(|s| !s.trim().is_empty()),
-            user_email: env_str("OUTLOOK_USER_EMAIL")
-                .or(file.user_email)
-                .unwrap_or_default(),
+            user_email,
+            shared_mailboxes,
             token_path,
             attachment_root,
             calendar_timezone: tz,
@@ -140,15 +168,32 @@ impl Config {
             && !self.tenant_id.contains("your_")
     }
 
+    /// True for the signed-in user's own mailbox or one of the configured
+    /// shared mailboxes. Comparison is case-insensitive and ignores surrounding
+    /// whitespace, matching how Graph resolves UPNs.
+    pub fn allows_mailbox(&self, target: &str) -> bool {
+        let target = target.trim();
+        target.eq_ignore_ascii_case(self.user_email.trim())
+            || self
+                .shared_mailboxes
+                .iter()
+                .any(|mailbox| mailbox.eq_ignore_ascii_case(target))
+    }
+
     pub fn summary(&self) -> String {
         format!(
-            "configured={} read_only={} auth=delegated mailbox={} tz={} attachment_root={} tokens={} config={}",
+            "configured={} read_only={} auth=delegated mailbox={} shared={} tz={} attachment_root={} tokens={} config={}",
             self.is_configured(),
             self.read_only,
             if self.user_email.is_empty() {
                 "<unset>"
             } else {
                 &self.user_email
+            },
+            if self.shared_mailboxes.is_empty() {
+                "<none>".to_string()
+            } else {
+                self.shared_mailboxes.join(",")
             },
             self.calendar_timezone,
             self.attachment_root.display(),
@@ -226,6 +271,7 @@ mod tests {
             client_id: "c".into(),
             client_secret: Some("s".into()),
             user_email: "u@example.com".into(),
+            shared_mailboxes: Vec::new(),
             token_path: PathBuf::from("/tmp/tokens.json"),
             attachment_root: PathBuf::from("/tmp"),
             calendar_timezone: DEFAULT_TIMEZONE.into(),
@@ -236,5 +282,85 @@ mod tests {
             source: None,
         };
         assert!(!cfg.is_configured());
+    }
+
+    fn config_with(user_email: &str, shared: &[&str]) -> Config {
+        Config {
+            tenant_id: "t".into(),
+            client_id: "c".into(),
+            client_secret: None,
+            user_email: user_email.into(),
+            shared_mailboxes: shared.iter().map(|m| (*m).to_string()).collect(),
+            token_path: PathBuf::from("/tmp/tokens.json"),
+            attachment_root: PathBuf::from("/tmp"),
+            calendar_timezone: DEFAULT_TIMEZONE.into(),
+            excluded_folder_ids: HashSet::new(),
+            skip_excluded_folders: false,
+            signoff_name: DEFAULT_SIGNOFF.into(),
+            read_only: true,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn own_mailbox_is_always_allowed() {
+        let cfg = config_with("me@example.com", &[]);
+        assert!(cfg.allows_mailbox("me@example.com"));
+        assert!(cfg.allows_mailbox("  ME@example.com  "));
+    }
+
+    #[test]
+    fn shared_mailboxes_are_allowed_case_insensitively() {
+        let cfg = config_with("me@example.com", &["devops@example.com"]);
+        assert!(cfg.allows_mailbox("devops@example.com"));
+        assert!(cfg.allows_mailbox("DevOps@Example.COM"));
+        assert!(!cfg.allows_mailbox("other@example.com"));
+    }
+
+    #[test]
+    fn empty_allowlist_still_rejects_other_mailboxes() {
+        let cfg = config_with("me@example.com", &[]);
+        assert!(!cfg.allows_mailbox("devops@example.com"));
+    }
+
+    #[test]
+    fn shared_mailboxes_parse_from_file_env_and_dedupe() {
+        let dir = std::env::temp_dir().join(format!("m365-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "user_email = \"me@example.com\"\nshared_mailboxes = [\"devops@example.com\"]\n",
+        )
+        .unwrap();
+
+        let from_file = Config::load(Some(&path)).unwrap();
+        assert_eq!(from_file.shared_mailboxes, vec!["devops@example.com"]);
+        assert!(from_file.allows_mailbox("devops@example.com"));
+
+        // The environment wins over the file and is deduped case-insensitively.
+        // SAFETY: this is the only test that touches these variables, and it
+        // restores them before returning.
+        unsafe {
+            std::env::set_var(
+                "OUTLOOK_SHARED_MAILBOXES",
+                " devops@example.com , ,devops@example.com,support@example.com ",
+            );
+        }
+        let from_env = Config::load(Some(&path)).unwrap();
+        unsafe {
+            std::env::remove_var("OUTLOOK_SHARED_MAILBOXES");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            from_env.shared_mailboxes,
+            vec!["devops@example.com", "support@example.com"]
+        );
+        assert!(
+            from_env
+                .summary()
+                .contains("shared=devops@example.com,support@example.com")
+        );
     }
 }

@@ -178,7 +178,7 @@ impl GraphClient {
             "{}/{}/oauth2/v2.0/token",
             self.login_base, self.cfg.tenant_id
         );
-        let scope = crate::auth::scopes(self.cfg.read_only);
+        let scope = crate::auth::scopes(self.cfg.read_only, !self.cfg.shared_mailboxes.is_empty());
         let mut form: Vec<(&str, &str)> = vec![
             ("client_id", self.cfg.client_id.as_str()),
             ("grant_type", "refresh_token"),
@@ -283,12 +283,14 @@ impl GraphClient {
             return Err(GraphError::NotConfigured);
         }
 
-        // Delegated tokens only reach the signed-in user's mailbox. Reject any
-        // other `mailbox` argument explicitly instead of relying on a Graph 403.
-        let configured = self.cfg.user_email.trim();
-        if !configured.is_empty() && !target.eq_ignore_ascii_case(configured) {
+        // Delegated tokens reach the signed-in user's mailbox plus any mailbox
+        // the user has been delegated in Exchange, provided the matching
+        // `.Shared` scopes are in the token. Anything outside that allowlist is
+        // rejected here instead of relying on a Graph 403.
+        if !self.cfg.allows_mailbox(&target) {
             return Err(GraphError::Message(format!(
-                "mailbox '{target}' is not the configured user '{configured}' — this server is bound to a single delegated identity"
+                "mailbox '{target}' is not the configured user '{}' or a configured shared mailbox — add it to shared_mailboxes to allow it",
+                self.cfg.user_email
             )));
         }
 

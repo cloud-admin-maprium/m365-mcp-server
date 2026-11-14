@@ -96,6 +96,24 @@ async fn serve(config_path: Option<&std::path::Path>) -> Result<()> {
             "no config file found; using defaults + environment (expected at ~/.config/m365-mcp/config.toml)"
         );
     }
+    if !config.shared_mailboxes.is_empty() {
+        tracing::info!("shared mailboxes: {}", config.shared_mailboxes.join(", "));
+        // `Mail.Read.Shared` is what makes `/users/{shared}` resolve. A token
+        // issued before the allowlist existed cannot gain scopes by refreshing,
+        // so call that out instead of letting the first tool call fail with 403.
+        let missing_shared_scope = match token::load(&config.token_path) {
+            Some(tokens) => tokens
+                .scope
+                .as_deref()
+                .is_none_or(|scope| !scope.contains("Mail.Read.Shared")),
+            None => false,
+        };
+        if missing_shared_scope {
+            tracing::warn!(
+                "saved tokens have no Mail.Read.Shared scope — run `m365-mcp-server login` to consent to the shared-mailbox scopes"
+            );
+        }
+    }
 
     let read_only = config.read_only;
     if read_only {
