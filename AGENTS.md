@@ -28,11 +28,19 @@
   (`encodeURIComponent` semantics), OData literals through `odata_quote()`.
 - **Secrets never reach a log line.** `Config::summary()` is the only sanctioned
   way to describe configuration.
+- **Classify every new tool.** `WRITE_TOOLS` / `READ_TOOLS` in `src/tools.rs`
+  must stay disjoint and together cover all 24 tools — the tests in
+  `src/tools.rs::tests` fail if a `#[tool]` is added without a home or listed
+  twice. Read-only is the default (`read_only` defaults to `true`), so a new
+  mutating tool that isn't in `WRITE_TOOLS` is silently absent from both
+  `tools/list` and `tools/call`.
 
 ## Before finishing a change
 
 ```bash
 make check     # cargo fmt --check, clippy --all-targets -D warnings, cargo test
+make release   # build the release binary first: make tools/smoke run
+               # target/release/$(BIN), which make check does not build
 make tools     # tools/list via a real MCP client handshake — diff when changing schemas
 ```
 
